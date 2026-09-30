@@ -1,0 +1,15 @@
+services:
+  carbon-api:
+    build: .
+    image: product-carbon-footprint-api:latest
+    container_name: product-carbon-footprint-api
+    ports:
+      - "8000:8000"
+    environment:
+      CARBON_DB_PATH: /data/carbon.db
+    volumes:
+      - carbon-data:/data
+    restart: unless-stopped
+
+volumes:
+  carbon-data:
