@@ -21,8 +21,13 @@
   传递比例、因子版本与因子值（证据随快照固化）
 - **幂等**：以「规范化输入摘要 + 因子版本」的 SHA-256 作为幂等键，重复提交返回同一快照；
   节点重排不产生新快照；`client_request_id` 冲突返回 409
+- **因子版本只增不改**：`POST /api/factor-versions` 对同名版本仅在因子 ref 集合、名称、单位
+  与 Decimal 数值（`0.10` 与 `0.1` 视为相同）全部一致时幂等返回 200；任一差异返回 409 且
+  **不写入/不删除任何行**，并发同名提交由 `BEGIN IMMEDIATE` 事务串行化，新内容必须改用新版本名
 - **不可变快照**：因子更新**永不改写历史**；用新因子版本重算会生成**新快照**并通过
-  `source_snapshot` 关联，返回逐产品差异（新旧单位足迹、Δ、Δ%）与因子变更清单
+  `source_snapshot` 关联，返回逐产品差异（新旧单位足迹、Δ、Δ%）与因子变更清单。
+  因子变更清单的新旧值均取自两个快照封存的 `factors_used`，与 `product_diffs` 同源，
+  不读取可能已变动的因子目录
 - 内置两个种子因子版本：`v2023-01`（基准）、`v2024-01`（因子下降，便于演示重算差异）
 
 ## 一键启动（Docker Compose）
@@ -59,20 +64,80 @@ pytest -q
 | --- | --- | --- |
 | GET  | `/health` | 健康检查 |
 | GET  | `/api/factor-versions` | 列出因子版本及全部因子 |
-| POST | `/api/factor-versions` | 登记/更新因子版本（新版本 201，已存在 200） |
+| POST | `/api/factor-versions` | 登记因子版本：新版本 201；内容完全相同的重提交 200；同名版本内容有任何差异 409 |
 | POST | `/api/assessments` | 提交核算（首次 201，幂等重放 200） |
 | GET  | `/api/snapshots?limit=&offset=` | 快照列表 |
 | GET  | `/api/snapshots/{id}` | 快照完整证据（输入、结果、因子副本） |
 | GET  | `/api/snapshots/{id}/products/{product_id}` | 单产品足迹与贡献链 |
 | POST | `/api/snapshots/{id}/recalculate` | 用新因子版本生成新快照并返回逐产品差异 |
 
-> **不可变性**：没有任何修改/删除快照的接口。`POST /api/factor-versions` 允许向
-> 新版本写数据；即使重新登记同名版本，旧快照 `result` 内的因子副本与计算结果也不变。
+> **不可变性**：没有任何修改/删除快照的接口，也没有任何覆盖因子版本的接口。
+> 因子版本一经登记即为只增证据：同名重提交只有内容完全一致才幂等返回 `200`，
+> 否则返回 `409`（见下方示例 0）；即便如此，快照 `result` 内的因子副本与计算结果也不变。
 
 ## 实际请求 / 响应示例
 
 场景：1000 kg 原油经「炼制」过程（天然气 + 电网电力直排）产出汽油 400 / 柴油 500 /
 渣油 50 kg（质量分摊）；全部柴油再进入「配送」过程（公路货运）交付。
+
+### 0) 登记因子版本（新版本 201 / 幂等 200 / 冲突 409）
+
+登记一个新版本：
+
+```bash
+curl -s -X POST http://localhost:8000/api/factor-versions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "v2025-01",
+    "factors": [
+      {"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+       "kg_co2e_per_unit": "1.20"}
+    ]
+  }'
+```
+
+新版本返回 `201 Created`：
+
+```json
+{"version": "v2025-01", "created": true, "factor_count": 1}
+```
+
+用完全相同的内容再提交一次（即使把 `1.20` 写成 `1.200`，Decimal 数值等价）→
+`200 OK`，不产生任何写入：
+
+```json
+{"version": "v2025-01", "created": false, "factor_count": 1}
+```
+
+若同名版本的**任一**因子发生变化——ref 集合（增/删因子）、名称、单位或数值——则
+`409 Conflict`，事务整体回滚，目录中既不会出现半个新因子，旧因子也不会被覆盖。
+例如把数值改成 `1.05`：
+
+```json
+{
+  "error": {
+    "code": "FACTOR_VERSION_CONFLICT",
+    "message": "因子版本 v2025-01 已存在且内容不同；版本一经登记即不可变，请使用新的版本名提交变更",
+    "details": {
+      "version": "v2025-01",
+      "differences": [
+        {"factor_ref": "ef.hydrogen", "change": "value_changed",
+         "old_kg_co2e_per_unit": "1.200000000000",
+         "new_kg_co2e_per_unit": "1.050000000000",
+         "delta_kg_co2e_per_unit": "-0.150000000000"}
+      ]
+    }
+  }
+}
+```
+
+`differences` 逐项列出差异，`change` 取值：`value_changed`（数值变化）、
+`unit_changed`（单位变化）、`name_changed`（名称变化）、
+`missing_in_request`（新版本删掉了已登记因子）、`added_in_request`（新版本多出因子）。
+变化后的因子请改用**新版本名**（如 `v2025-02`）登记。同一请求体内 ref 重复则返回
+`422`（`FACTOR_VERSION_VALIDATION_FAILED` / `DUPLICATE_FACTOR`）。并发同名提交由
+单条 `BEGIN IMMEDIATE` 事务串行化：恰好一个提交创建版本，其余同内容提交得到 `200`、
+异内容提交得到 `409`，不会出现部分写入或行互相混合。
 
 ### 1) 提交核算
 
@@ -270,9 +335,20 @@ curl -s -X POST \
   },
   "factor_changes": [
     {"factor_ref": "ef.crude_oil", "status": "changed",
+     "old_unit": "kg", "new_unit": "kg",
      "old_kg_co2e_per_unit": "0.080000000000",
      "new_kg_co2e_per_unit": "0.075000000000",
-     "delta_kg_co2e_per_unit": "-0.005000000000"}
+     "delta_kg_co2e_per_unit": "-0.005000000000"},
+    {"factor_ref": "ef.grid_electricity", "status": "changed",
+     "old_unit": "kWh", "new_unit": "kWh",
+     "old_kg_co2e_per_unit": "0.703500000000",
+     "new_kg_co2e_per_unit": "0.570300000000",
+     "delta_kg_co2e_per_unit": "-0.133200000000"},
+    {"factor_ref": "ef.truck_freight", "status": "changed",
+     "old_unit": "tkm", "new_unit": "tkm",
+     "old_kg_co2e_per_unit": "0.090000000000",
+     "new_kg_co2e_per_unit": "0.082000000000",
+     "delta_kg_co2e_per_unit": "-0.008000000000"}
   ],
   "product_diffs": [
     {"product_id": "diesel_delivered", "status": "changed",
@@ -287,7 +363,10 @@ curl -s -X POST \
 
 再查旧快照 `GET /api/snapshots/snap_404159d90ed529d8`，单位足迹仍是
 `0.235315789474`，因子副本仍是 `v2023-01` 的数值——历史不会被因子更新改写。
-重算接口本身也是幂等的：第二次调用返回 `200` 与同一个新快照 ID。
+`factor_changes` 的新旧值同样取自**两个快照封存的 `factors_used`**，而非当前因子表：
+即使旧版本的目录行在旧版本服务中曾被覆盖，重算时报告的旧值仍是旧快照当初计算所用的值，
+与 `product_diffs` 的口径完全一致（本示例中 `ef.natural_gas` 两个版本数值相同，故不出现在
+清单中）。重算接口本身也是幂等的：第二次调用返回 `200` 与同一个新快照 ID。
 
 ### 5) 错误响应示例（环 + 负量 + 零分母一次性返回）
 
@@ -323,7 +402,11 @@ curl -s -X POST \
   （消耗量/上游批量）；再按所选权重分摊到本过程的全部联产品。贡献链携带每一段的
   缩放与分摊因子，可逐条审计。
 - **证据固化**：快照表保存原始请求 JSON、完整结果 JSON（含 `factors_used` 因子值副本）、
-  输入哈希、因子版本、来源快照与 UTC 时间戳，只增不改。
+  输入哈希、因子版本、来源快照与 UTC 时间戳，只增不改。重算差异的因子新旧值直接读两份
+  `factors_used` 副本，不回查因子目录，因此与 `product_diffs` 同源、不受后续目录变化影响。
+- **因子版本只增不改**：`factors` 表只有 `INSERT` 路径（无 `UPDATE`/`REPLACE`）。登记在
+  单条 `BEGIN IMMEDIATE` 事务内完成「查重 → 比对 → 插入」，配合进程内写锁，保证并发同名
+  提交要么完整创建、要么幂等/409，绝不部分写入或互相覆盖。
 - **数值口径**：全链路 `Decimal`（进入时从字符串构造，拒绝 NaN/Infinity），
   50 位上下文运算，输出量化到 12 位小数，差异百分比量化到 6 位。
 
@@ -337,8 +420,8 @@ app/
   graph.py        Kahn 拓扑排序 / Tarjan 环检测
   idempotency.py  规范化输入摘要与 SHA-256
   decimals.py     Decimal 精度、量化、JSON 化
-  db.py           SQLite schema 与快照/因子仓储
+  db.py           SQLite schema 与快照/因子仓储（因子版本只追加）
   seed.py         内置 v2023-01 / v2024-01 因子
-tests/            17 个端到端测试（pytest + TestClient）
+tests/            24 个端到端测试（pytest + TestClient）
 docker-compose.yml / Dockerfile
 ```

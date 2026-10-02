@@ -69,20 +69,34 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 # -------- factor versions --------------------------------------------------
+#
+# Factor versions are append-only evidence, just like snapshots: there is no
+# UPDATE/REPLACE path.  Re-registering an existing version goes through the
+# service layer, which either confirms an exact idempotent resubmission or
+# rejects the write with 409 — stored factor rows are never rewritten.
 
-def upsert_factor_version(conn: sqlite3.Connection, version: str,
+def factor_version_exists(conn: sqlite3.Connection, version: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM factor_versions WHERE version = ?",
+        (version,)).fetchone() is not None
+
+
+def insert_factor_version(conn: sqlite3.Connection, version: str,
                           factors: List[Dict[str, Any]]) -> None:
-    with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO factor_versions(version, created_at) "
-            "VALUES (?, ?)", (version, utcnow()))
-        for f in factors:
-            conn.execute(
-                "INSERT OR REPLACE INTO factors"
-                "(version, ref, name, unit, kg_co2e_per_unit) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (version, f["ref"], f.get("name"), f["unit"],
-                 str(f["kg_co2e_per_unit"])))
+    """Insert a brand-new version and all its factor rows.
+
+    Must run inside a caller-managed transaction.  A duplicate version or
+    factor ref raises ``sqlite3.IntegrityError`` instead of replacing
+    anything.
+    """
+    conn.execute(
+        "INSERT INTO factor_versions(version, created_at) VALUES (?, ?)",
+        (version, utcnow()))
+    conn.executemany(
+        "INSERT INTO factors(version, ref, name, unit, kg_co2e_per_unit) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(version, f["ref"], f.get("name"), f["unit"],
+          str(f["kg_co2e_per_unit"])) for f in factors])
 
 
 def list_factor_versions(conn: sqlite3.Connection) -> List[str]:

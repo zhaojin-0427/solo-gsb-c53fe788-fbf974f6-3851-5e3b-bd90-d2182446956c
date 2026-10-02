@@ -11,14 +11,16 @@ from typing import Any, Dict, Optional
 from . import db
 from .accounting import Factor, calculate
 from .decimals import percent_str, to_decimal, to_jsonable
-from .errors import ConflictError, NotFoundError
+from .errors import AccountingError, ConflictError, NotFoundError
 from .idempotency import input_hash
-from .models import AccountingRequest, RecalculateRequest
+from .models import AccountingRequest, FactorVersionRequest, RecalculateRequest
 
 ZERO = Decimal("0")
 
 # One shared SQLite connection per process: serialise check-then-write
-# sequences so concurrent submissions can't interleave.
+# sequences so concurrent submissions can't interleave.  Factor-version
+# registration additionally opens an IMMEDIATE transaction so that
+# multi-process deployments get the same all-or-nothing guarantee.
 _write_lock = threading.RLock()
 
 
@@ -33,7 +35,7 @@ def _serial(fn):
 def _load_factors(conn: sqlite3.Connection, version: str
                   ) -> Dict[str, Factor]:
     raw = db.get_factors(conn, version)
-    if not raw and version not in db.list_factor_versions(conn):
+    if not raw and not db.factor_version_exists(conn, version):
         raise NotFoundError(
             "FACTOR_VERSION_NOT_FOUND",
             f"排放因子版本不存在: {version}（可通过 GET /api/factor-versions 查询，"
@@ -41,6 +43,114 @@ def _load_factors(conn: sqlite3.Connection, version: str
     return {ref: (f["ref"], f["unit"], to_decimal(f["kg_co2e_per_unit"]),
                   f["name"])
             for ref, f in raw.items()}
+
+
+def _factor_payloads(req: FactorVersionRequest) -> list:
+    return [{"ref": f.ref, "name": f.name, "unit": f.unit,
+             "kg_co2e_per_unit": f.kg_co2e_per_unit} for f in req.factors]
+
+
+def _factor_version_diff(existing: Dict[str, Dict[str, Any]],
+                         submitted: Dict[str, Any]) -> list:
+    """Explain why a resubmitted version is not identical.
+
+    Decimal values are compared numerically (``0.10`` equals ``0.1``);
+    names, units and the set of factor refs are compared literally.
+    """
+    diffs = []
+    for ref in sorted(set(existing) | set(submitted)):
+        old = existing.get(ref)
+        new = submitted.get(ref)
+        if old is None:
+            diffs.append({
+                "factor_ref": ref, "change": "added_in_request",
+                "name": new["name"], "unit": new["unit"],
+                "kg_co2e_per_unit": new["kg_co2e_per_unit"]})
+            continue
+        if new is None:
+            diffs.append({
+                "factor_ref": ref, "change": "missing_in_request",
+                "name": old["name"], "unit": old["unit"],
+                "kg_co2e_per_unit": to_decimal(old["kg_co2e_per_unit"])})
+            continue
+        if (old["name"] or None) != (new["name"] or None):
+            diffs.append({"factor_ref": ref, "change": "name_changed",
+                          "old_name": old["name"], "new_name": new["name"]})
+        if old["unit"] != new["unit"]:
+            diffs.append({"factor_ref": ref, "change": "unit_changed",
+                          "old_unit": old["unit"],
+                          "new_unit": new["unit"]})
+        old_value = to_decimal(old["kg_co2e_per_unit"])
+        new_value = new["kg_co2e_per_unit"]
+        if old_value != new_value:
+            diffs.append({
+                "factor_ref": ref, "change": "value_changed",
+                "old_kg_co2e_per_unit": old_value,
+                "new_kg_co2e_per_unit": new_value,
+                "delta_kg_co2e_per_unit": new_value - old_value})
+    return to_jsonable(diffs)
+
+
+@_serial
+def register_factor_version(conn: sqlite3.Connection,
+                            req: FactorVersionRequest) -> Dict[str, Any]:
+    """Register a factor version with append-only, conflict-aware semantics.
+
+    * Unknown version  -> insert atomically, report ``created=True`` (201).
+    * Existing version identical in factor-ref set, names, units and Decimal
+      values -> idempotent no-op, report ``created=False`` (200).
+    * Existing version with any difference -> 409, no row is inserted,
+      updated or deleted; callers must publish changes under a new version
+      name.
+
+    The check-and-insert runs in one ``BEGIN IMMEDIATE`` transaction (the
+    SQLite write lock is taken before the read), so two concurrent same-named
+    submissions can never interleave into a partial write or silently
+    overwrite one another.  The process-wide write lock serialises
+    same-process callers as well.
+    """
+    seen = set()
+    issues = []
+    for f in req.factors:
+        if f.ref in seen:
+            issues.append({
+                "path": f"factors[ref={f.ref}]",
+                "code": "DUPLICATE_FACTOR",
+                "message": f"因子标识在同一版本中重复: {f.ref}"})
+        seen.add(f.ref)
+    if issues:
+        raise AccountingError(
+            issues, code="FACTOR_VERSION_VALIDATION_FAILED",
+            message="因子版本登记请求校验失败")
+
+    submitted = {f["ref"]: f for f in _factor_payloads(req)}
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not db.factor_version_exists(conn, req.version):
+            db.insert_factor_version(
+                conn, req.version, _factor_payloads(req))
+            conn.commit()
+            return {"version": req.version, "created": True,
+                    "factor_count": len(req.factors)}
+
+        differences = _factor_version_diff(
+            db.get_factors(conn, req.version), submitted)
+        conn.rollback()
+        if not differences:
+            return {"version": req.version, "created": False,
+                    "factor_count": len(req.factors)}
+        raise ConflictError(
+            "FACTOR_VERSION_CONFLICT",
+            f"因子版本 {req.version} 已存在且内容不同；版本一经登记即不可变，"
+            "请使用新的版本名提交变更",
+            {"version": req.version, "differences": differences})
+    except ConflictError:
+        raise
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def _new_snapshot_id(inhash: str) -> str:
@@ -189,13 +299,20 @@ def _diff_products(old: Dict[str, Any], new: Dict[str, Any]) -> list:
     return to_jsonable(diffs)
 
 
-def _factor_changes(conn, old_result: Dict[str, Any],
+def _factor_changes(old_result: Dict[str, Any],
                     new_result: Dict[str, Any]) -> list:
-    old = db.get_factors(conn, old_result["factor_version"])
-    new = db.get_factors(conn, new_result["factor_version"])
-    # Only factors referenced by this assessment are evidence-relevant.
-    refs = sorted({f["ref"] for f in old_result.get("factors_used", [])}
-                  | {f["ref"] for f in new_result.get("factors_used", [])})
+    """Factor-value differences evidenced *by the two snapshots*.
+
+    Both sides come from the snapshots' sealed ``factors_used`` copies, never
+    from the live factor table: even if the old version's catalogue rows were
+    rewritten before immutability was enforced, the "old" values reported here
+    are exactly the values the old snapshot was computed with (and therefore
+    match ``product_diffs``).  Only factors referenced by this assessment are
+    evidence-relevant.
+    """
+    old = {f["ref"]: f for f in old_result.get("factors_used", [])}
+    new = {f["ref"]: f for f in new_result.get("factors_used", [])}
+    refs = sorted(set(old) | set(new))
     changes = []
     for ref in refs:
         if ref not in old:
@@ -286,7 +403,7 @@ def recalculate(conn, snapshot_id: str, body: RecalculateRequest
         "source_snapshot_id": snapshot_id,
         "source_factor_version": row["factor_version"],
         "new_snapshot": new_snap,
-        "factor_changes": _factor_changes(conn, old_result, new_snap["result"]),
+        "factor_changes": _factor_changes(old_result, new_snap["result"]),
         "product_diffs": diffs,
         "changed_product_count": len(changed),
     }

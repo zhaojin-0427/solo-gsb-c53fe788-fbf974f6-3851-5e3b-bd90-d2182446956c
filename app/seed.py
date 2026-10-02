@@ -37,8 +37,9 @@ def seed(conn) -> None:
     for version, factors in SEED_VERSIONS.items():
         if version in existing:
             continue
-        db.upsert_factor_version(conn, version, [
-            {"ref": ref, "name": name, "unit": unit,
-             "kg_co2e_per_unit": value}
-            for ref, name, unit, value in factors
-        ])
+        with conn:
+            db.insert_factor_version(conn, version, [
+                {"ref": ref, "name": name, "unit": unit,
+                 "kg_co2e_per_unit": value}
+                for ref, name, unit, value in factors
+            ])
