@@ -6,14 +6,14 @@ import json
 import sqlite3
 import threading
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import db
 from .accounting import Factor, calculate
 from .decimals import percent_str, to_decimal, to_jsonable
-from .errors import ConflictError, NotFoundError
+from .errors import AccountingError, ConflictError, NotFoundError
 from .idempotency import input_hash
-from .models import AccountingRequest, RecalculateRequest
+from .models import AccountingRequest, FactorVersionRequest, RecalculateRequest
 
 ZERO = Decimal("0")
 
@@ -41,6 +41,117 @@ def _load_factors(conn: sqlite3.Connection, version: str
     return {ref: (f["ref"], f["unit"], to_decimal(f["kg_co2e_per_unit"]),
                   f["name"])
             for ref, f in raw.items()}
+
+
+# -------- factor version registration (immutable) -------------------------
+
+def _requested_factors(req: FactorVersionRequest) -> List[Dict[str, Any]]:
+    return [{"ref": f.ref, "name": f.name, "unit": f.unit,
+             "kg_co2e_per_unit": f.kg_co2e_per_unit} for f in req.factors]
+
+
+def _factor_version_conflicts(existing: Dict[str, Dict[str, Any]],
+                              requested: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Describe every way a resubmission differs from the sealed version.
+
+    A resubmission is idempotent only when the factor-ref set, each factor's
+    name/unit and the Decimal value are all equal (numeric comparison, so
+    ``0.10`` equals ``0.1``).
+    """
+    issues: List[Dict[str, str]] = []
+    old_refs = set(existing)
+    new_refs = {f["ref"] for f in requested}
+    for ref in sorted(new_refs - old_refs):
+        issues.append({"path": f"factors[ref={ref}]", "code": "FACTOR_ADDED",
+                       "message": f"版本已封存，不能新增因子: {ref}"})
+    for ref in sorted(old_refs - new_refs):
+        issues.append({"path": f"factors[ref={ref}]", "code": "FACTOR_REMOVED",
+                       "message": f"版本已封存，不能删除因子: {ref}"})
+    for f in requested:
+        ref = f["ref"]
+        if ref not in existing:
+            continue
+        old = existing[ref]
+        if old["name"] != f["name"]:
+            issues.append({
+                "path": f"factors[ref={ref}].name",
+                "code": "FACTOR_NAME_CONFLICT",
+                "message": f"因子 {ref} 的名称与已封存版本不一致: "
+                           f"{old['name']!r} != {f['name']!r}"})
+        if old["unit"] != f["unit"]:
+            issues.append({
+                "path": f"factors[ref={ref}].unit",
+                "code": "FACTOR_UNIT_CONFLICT",
+                "message": f"因子 {ref} 的单位与已封存版本不一致: "
+                           f"{old['unit']} != {f['unit']}"})
+        old_value = to_decimal(old["kg_co2e_per_unit"])
+        if old_value != f["kg_co2e_per_unit"]:
+            issues.append({
+                "path": f"factors[ref={ref}].kg_co2e_per_unit",
+                "code": "FACTOR_VALUE_CONFLICT",
+                "message": f"因子 {ref} 的数值与已封存版本不一致: "
+                           f"{old_value} != {f['kg_co2e_per_unit']}"})
+    return issues
+
+
+@_serial
+def register_factor_version(conn: sqlite3.Connection,
+                            req: FactorVersionRequest) -> Dict[str, Any]:
+    """Register an immutable factor version.
+
+    * New version name -> ``created=True`` (HTTP 201).
+    * Existing version with fully identical content (ref set, names, units,
+      Decimal values) -> idempotent replay (HTTP 200).
+    * Existing version with *any* difference -> 409; nothing is written.
+      Changed content must be submitted under a new version name.
+    """
+    factors = _requested_factors(req)
+
+    # A single request must not carry the same ref twice: the factors table
+    # could not seal both rows, and accepting one silently would be ambiguous.
+    seen = set()
+    duplicate_issues = []
+    for f in factors:
+        if f["ref"] in seen:
+            duplicate_issues.append({
+                "path": f"factors[ref={f['ref']}]",
+                "code": "DUPLICATE_FACTOR",
+                "message": f"因子版本 {req.version} 中因子标识重复: {f['ref']}"})
+        seen.add(f["ref"])
+    if duplicate_issues:
+        raise AccountingError(duplicate_issues,
+                              message="因子版本登记校验失败")
+
+    existing = db.get_factors(conn, req.version)
+    if existing:
+        issues = _factor_version_conflicts(existing, factors)
+        if issues:
+            raise ConflictError(
+                "FACTOR_VERSION_CONFLICT",
+                f"因子版本 {req.version} 已封存且内容不一致；"
+                "版本不可覆盖，请改用新的版本名提交",
+                {"version": req.version, "issues": issues})
+        return {"version": req.version, "created": False,
+                "idempotent_replay": True, "factor_count": len(factors)}
+
+    try:
+        db.insert_factor_version(conn, req.version, factors)
+    except sqlite3.IntegrityError:
+        # Lost a race with another connection that created the same version
+        # name.  Its content now decides replay (200) vs. conflict (409);
+        # either way our rolled-back transaction left nothing behind.
+        existing = db.get_factors(conn, req.version)
+        issues = _factor_version_conflicts(existing, factors)
+        if not issues:
+            return {"version": req.version, "created": False,
+                    "idempotent_replay": True, "factor_count": len(factors)}
+        raise ConflictError(
+            "FACTOR_VERSION_CONFLICT",
+            f"因子版本 {req.version} 已封存且内容不一致；"
+            "版本不可覆盖，请改用新的版本名提交",
+            {"version": req.version, "issues": issues})
+    return {"version": req.version, "created": True,
+            "idempotent_replay": False, "factor_count": len(factors)}
 
 
 def _new_snapshot_id(inhash: str) -> str:
@@ -189,13 +300,22 @@ def _diff_products(old: Dict[str, Any], new: Dict[str, Any]) -> list:
     return to_jsonable(diffs)
 
 
-def _factor_changes(conn, old_result: Dict[str, Any],
+def _sealed_factors(result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Factor values as frozen inside a snapshot's ``factors_used``.
+
+    History must be reconstructed from the sealed evidence, never from the
+    live factors table: a factor version that was wrongly overwritten in the
+    past would otherwise leak its new value into an old snapshot's diff.
+    """
+    return {f["ref"]: f for f in result.get("factors_used", [])}
+
+
+def _factor_changes(old_result: Dict[str, Any],
                     new_result: Dict[str, Any]) -> list:
-    old = db.get_factors(conn, old_result["factor_version"])
-    new = db.get_factors(conn, new_result["factor_version"])
+    old = _sealed_factors(old_result)
+    new = _sealed_factors(new_result)
     # Only factors referenced by this assessment are evidence-relevant.
-    refs = sorted({f["ref"] for f in old_result.get("factors_used", [])}
-                  | {f["ref"] for f in new_result.get("factors_used", [])})
+    refs = sorted(set(old) | set(new))
     changes = []
     for ref in refs:
         if ref not in old:
@@ -286,7 +406,7 @@ def recalculate(conn, snapshot_id: str, body: RecalculateRequest
         "source_snapshot_id": snapshot_id,
         "source_factor_version": row["factor_version"],
         "new_snapshot": new_snap,
-        "factor_changes": _factor_changes(conn, old_result, new_snap["result"]),
+        "factor_changes": _factor_changes(old_result, new_snap["result"]),
         "product_diffs": diffs,
         "changed_product_count": len(changed),
     }

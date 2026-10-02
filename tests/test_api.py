@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from tests.conftest import REFINERY_REQUEST
 
 
@@ -99,28 +101,248 @@ def test_client_request_id_conflict(client):
     assert r2.json()["error"]["code"] == "CLIENT_REQUEST_ID_CONFLICT"
 
 
-def test_factor_update_does_not_rewrite_history(client):
+def test_factor_version_is_immutable_conflict_keeps_history(client):
     created = client.post("/api/assessments",
                           json=REFINERY_REQUEST).json()
     sid = created["snapshot_id"]
     assert Decimal(_products(created)["diesel"]["unit_kg_co2e"]) == Decimal(
         "0.217315789474")
 
-    # Re-register v2023-01 with different numbers (simulated bad update):
-    # the stored snapshot must stay byte-identical.
+    # Re-registering v2023-01 with different factors is rejected: 409,
+    # nothing is overwritten.
     tampered = {
         "version": "v2023-01",
         "factors": [
-            {"ref": "ef.crude_oil", "unit": "kg",
+            {"ref": "ef.crude_oil", "name": "原油开采与运输", "unit": "kg",
              "kg_co2e_per_unit": "9.999"}
         ]}
-    client.post("/api/factor-versions", json=tampered)
+    r = client.post("/api/factor-versions", json=tampered)
+    assert r.status_code == 409, r.text
+    err = r.json()["error"]
+    assert err["code"] == "FACTOR_VERSION_CONFLICT"
+    codes = {i["code"] for i in err["details"]["issues"]}
+    assert "FACTOR_VALUE_CONFLICT" in codes
+    # The whole sealed version is still there: missing refs are reported too.
+    assert "FACTOR_REMOVED" in codes
+
+    # Live factors table untouched.
+    versions = {v["version"]: v
+                for v in client.get("/api/factor-versions").json()
+                ["factor_versions"]}
+    sealed = {f["ref"]: f for f in versions["v2023-01"]["factors"]}
+    assert sealed["ef.crude_oil"]["kg_co2e_per_unit"] == "0.0800"
+    assert versions["v2023-01"]["factor_count"] == 7
+
+    # Snapshot evidence stays byte-identical.
     again = client.get(f"/api/snapshots/{sid}").json()
     assert Decimal(_products(again)["diesel"]["unit_kg_co2e"]) == Decimal(
         "0.217315789474")
-    # evidence keeps the original factor value inside the result
     used = {f["ref"]: f for f in again["result"]["factors_used"]}
     assert used["ef.crude_oil"]["kg_co2e_per_unit"] == "0.080000000000"
+
+
+def test_factor_version_identical_resubmit_is_idempotent(client):
+    payload = {
+        "version": "v2025-01",
+        "factors": [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+                     "kg_co2e_per_unit": "1.200"}]}
+    r1 = client.post("/api/factor-versions", json=payload)
+    assert r1.status_code == 201, r1.text
+    assert r1.json() == {"version": "v2025-01", "created": True,
+                         "idempotent_replay": False, "factor_count": 1}
+
+    # Same ref set / name / unit, numerically equal Decimal, even when the
+    # text differs (1.200 == 1.2) and list order is unchanged here.
+    again = {
+        "version": "v2025-01",
+        "factors": [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+                     "kg_co2e_per_unit": "1.2"}]}
+    r2 = client.post("/api/factor-versions", json=again)
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == {"version": "v2025-01", "created": False,
+                         "idempotent_replay": True, "factor_count": 1}
+
+
+def test_factor_version_any_change_conflicts(client):
+    base_factors = [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+                     "kg_co2e_per_unit": "1.2"}]
+    assert client.post("/api/factor-versions",
+                       json={"version": "v2025-01",
+                             "factors": base_factors}).status_code == 201
+
+    def conflict_codes(factors):
+        r = client.post("/api/factor-versions",
+                        json={"version": "v2025-01", "factors": factors})
+        assert r.status_code == 409, r.text
+        return {i["code"] for i in r.json()["error"]["details"]["issues"]}
+
+    # changed Decimal value
+    assert "FACTOR_VALUE_CONFLICT" in conflict_codes(
+        [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+          "kg_co2e_per_unit": "1.3"}])
+    # changed unit
+    assert "FACTOR_UNIT_CONFLICT" in conflict_codes(
+        [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "g",
+          "kg_co2e_per_unit": "1.2"}])
+    # changed name
+    assert "FACTOR_NAME_CONFLICT" in conflict_codes(
+        [{"ref": "ef.hydrogen", "name": "蓝氢", "unit": "kg",
+          "kg_co2e_per_unit": "1.2"}])
+    # added factor
+    assert "FACTOR_ADDED" in conflict_codes(
+        [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+          "kg_co2e_per_unit": "1.2"},
+         {"ref": "ef.ammonia", "name": "氨", "unit": "kg",
+          "kg_co2e_per_unit": "2"}])
+
+    # The changed content must be accepted under a new version name.
+    r = client.post("/api/factor-versions", json={
+        "version": "v2025-02",
+        "factors": [{"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+                     "kg_co2e_per_unit": "1.3"}]})
+    assert r.status_code == 201, r.text
+
+
+def test_duplicate_factor_ref_in_one_request_rejected(client):
+    r = client.post("/api/factor-versions", json={
+        "version": "v2025-03",
+        "factors": [
+            {"ref": "ef.x", "unit": "kg", "kg_co2e_per_unit": "1"},
+            {"ref": "ef.x", "unit": "kg", "kg_co2e_per_unit": "2"}]})
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["error"]["issues"]}
+    assert "DUPLICATE_FACTOR" in codes
+    # nothing was written
+    versions = {v["version"]
+                for v in client.get("/api/factor-versions").json()
+                ["factor_versions"]}
+    assert "v2025-03" not in versions
+
+
+def test_concurrent_same_name_submissions(client):
+    import threading
+
+    barrier = threading.Barrier(6)
+    outcomes = []
+
+    def post(value):
+        barrier.wait()
+        status = client.post("/api/factor-versions", json={
+            "version": "v2026-01",
+            "factors": [{"ref": "ef.a", "name": "A", "unit": "kg",
+                         "kg_co2e_per_unit": value}]}).status_code
+        outcomes.append((value, status))
+
+    threads = []
+    for _ in range(3):
+        threads.append(threading.Thread(target=post, args=("1",)))
+    for _ in range(3):
+        threads.append(threading.Thread(target=post, args=("2",)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one writer wins (201); same-content followers replay (200);
+    # the other content's writers all conflict (409).  Nothing is partially
+    # written and the loser never overwrites the winner.
+    winners = [v for v, s in outcomes if s == 201]
+    assert len(winners) == 1
+    winner = winners[0]
+    for value, status in outcomes:
+        if value == winner:
+            assert status in (200, 201)
+        else:
+            assert status == 409
+
+    versions = {v["version"]: v
+                for v in client.get("/api/factor-versions").json()
+                ["factor_versions"]}
+    v = versions["v2026-01"]
+    assert v["factor_count"] == 1
+    assert v["factors"][0]["kg_co2e_per_unit"] == winner
+
+
+def test_cross_connection_race_is_replay_or_conflict(tmp_path):
+    from app import db, seed
+    from app.errors import ConflictError
+    from app.models import FactorVersionRequest
+    from app.service import register_factor_version
+
+    path = str(tmp_path / "race.db")
+    conn1 = db.connect(path)
+    db.init_db(conn1)
+    seed.seed(conn1)
+    conn2 = db.connect(path)  # separate connection, no shared process lock
+
+    req = FactorVersionRequest.model_validate({
+        "version": "v2030-01",
+        "factors": [{"ref": "ef.a", "name": "A", "unit": "kg",
+                     "kg_co2e_per_unit": "1"}]})
+    assert register_factor_version(conn1, req)["created"] is True
+
+    # Identical content arriving on a second connection: the INSERT loses with
+    # IntegrityError but is recognised as an idempotent replay.
+    assert register_factor_version(conn2, req)["idempotent_replay"] is True
+
+    # Different content: conflict, and conn2's failed insert rolled back.
+    bad = FactorVersionRequest.model_validate({
+        "version": "v2030-01",
+        "factors": [{"ref": "ef.a", "name": "A", "unit": "kg",
+                     "kg_co2e_per_unit": "9"}]})
+    with pytest.raises(ConflictError) as excinfo:
+        register_factor_version(conn2, bad)
+    assert excinfo.value.code == "FACTOR_VERSION_CONFLICT"
+    assert db.get_factors(conn1, "v2030-01")["ef.a"][
+        "kg_co2e_per_unit"] == "1"
+    conn1.close()
+    conn2.close()
+
+
+def test_recalculate_uses_sealed_factors_even_if_version_overwritten(client):
+    sid = client.post("/api/assessments",
+                      json=REFINERY_REQUEST).json()["snapshot_id"]
+
+    # Simulate historical corruption (e.g. a pre-fix deployment that allowed
+    # the overwrite): tamper with the live factors table directly.
+    conn = client.app.state.db
+    with conn:
+        conn.execute(
+            "UPDATE factors SET kg_co2e_per_unit = '0.0500' "
+            "WHERE version = 'v2023-01' AND ref = 'ef.crude_oil'")
+
+    r = client.post(f"/api/snapshots/{sid}/recalculate",
+                    json={"factor_version": "v2024-01"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+
+    # product_diffs are computed from the two sealed snapshots; old value is
+    # still the original 0.235315..., not anything derived from 0.05.
+    diffs = {d["product_id"]: d for d in body["product_diffs"]}
+    d = diffs["diesel_delivered"]
+    assert d["old_unit_kg_co2e"] == "0.235315789474"
+    assert d["new_unit_kg_co2e"] == "0.214431578947"
+
+    # factor_changes old side must come from the old snapshot's sealed
+    # factors_used (0.08), consistent with product_diffs — never 0.05.
+    changes = {c["factor_ref"]: c for c in body["factor_changes"]}
+    crude = changes["ef.crude_oil"]
+    assert crude["old_kg_co2e_per_unit"] == "0.080000000000"
+    assert crude["new_kg_co2e_per_unit"] == "0.075000000000"
+    assert crude["delta_kg_co2e_per_unit"] == "-0.005000000000"
+
+    # Old snapshot evidence untouched and recalculation stays idempotent.
+    old = client.get(f"/api/snapshots/{sid}").json()
+    sealed = {f["ref"]: f for f in old["result"]["factors_used"]}
+    assert sealed["ef.crude_oil"]["kg_co2e_per_unit"] == "0.080000000000"
+    r2 = client.post(f"/api/snapshots/{sid}/recalculate",
+                     json={"factor_version": "v2024-01"})
+    assert r2.status_code == 200
+    assert (r2.json()["new_snapshot"]["snapshot_id"]
+            == body["new_snapshot"]["snapshot_id"])
+    crude2 = {c["factor_ref"]: c
+              for c in r2.json()["factor_changes"]}["ef.crude_oil"]
+    assert crude2["old_kg_co2e_per_unit"] == "0.080000000000"
 
 
 def test_recalculate_with_new_factor_version(client):

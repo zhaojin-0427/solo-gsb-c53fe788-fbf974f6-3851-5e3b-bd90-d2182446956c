@@ -21,8 +21,13 @@
   传递比例、因子版本与因子值（证据随快照固化）
 - **幂等**：以「规范化输入摘要 + 因子版本」的 SHA-256 作为幂等键，重复提交返回同一快照；
   节点重排不产生新快照；`client_request_id` 冲突返回 409
-- **不可变快照**：因子更新**永不改写历史**；用新因子版本重算会生成**新快照**并通过
-  `source_snapshot` 关联，返回逐产品差异（新旧单位足迹、Δ、Δ%）与因子变更清单
+- **不可变快照**：因子版本**只增不改**——重提同名版本时，因子 ref 集合、
+  名称、单位与 Decimal 数值全部一致才幂等返回 `200`，任一差异返回 `409`
+  （并发同名提交不会部分写入或互相覆盖），改值必须用新版本名。快照同样永不
+  修改；用新因子版本重算会生成**新快照**并通过 `source_snapshot` 关联，返回
+  逐产品差异（新旧单位足迹、Δ、Δ%）与因子变更清单。差异的新旧因子值全部取自
+  两个快照**封存的 `factors_used`**，即使旧版本曾被覆盖也与 `product_diffs`
+  口径一致
 - 内置两个种子因子版本：`v2023-01`（基准）、`v2024-01`（因子下降，便于演示重算差异）
 
 ## 一键启动（Docker Compose）
@@ -59,15 +64,22 @@ pytest -q
 | --- | --- | --- |
 | GET  | `/health` | 健康检查 |
 | GET  | `/api/factor-versions` | 列出因子版本及全部因子 |
-| POST | `/api/factor-versions` | 登记/更新因子版本（新版本 201，已存在 200） |
+| POST | `/api/factor-versions` | 登记不可变因子版本（新版本 201；内容完全一致的重提 200；同名但内容变化 409） |
 | POST | `/api/assessments` | 提交核算（首次 201，幂等重放 200） |
 | GET  | `/api/snapshots?limit=&offset=` | 快照列表 |
 | GET  | `/api/snapshots/{id}` | 快照完整证据（输入、结果、因子副本） |
 | GET  | `/api/snapshots/{id}/products/{product_id}` | 单产品足迹与贡献链 |
 | POST | `/api/snapshots/{id}/recalculate` | 用新因子版本生成新快照并返回逐产品差异 |
 
-> **不可变性**：没有任何修改/删除快照的接口。`POST /api/factor-versions` 允许向
-> 新版本写数据；即使重新登记同名版本，旧快照 `result` 内的因子副本与计算结果也不变。
+> **不可变性**：没有任何修改/删除快照的接口，也没有任何覆盖因子版本的接口。
+> `POST /api/factor-versions` 只接受**新版本名**；对已封存版本重提时，仅当
+> 因子 ref 集合、各因子名称、单位、Decimal 数值（按数值比较，`1.20` 与 `1.2`
+> 等价）**全部相同**才幂等返回 `200`，否则返回 `409 FACTOR_VERSION_CONFLICT`
+> 并在 `details.issues` 中逐项列出差异（`FACTOR_ADDED` / `FACTOR_REMOVED` /
+> `FACTOR_NAME_CONFLICT` / `FACTOR_UNIT_CONFLICT` / `FACTOR_VALUE_CONFLICT`）。
+> 因子版本与全部因子在单个 SQLite 事务中写入，并发同名提交至多一方成功，
+> 其余按内容返回 `200` 或 `409`，不会部分写入或互相覆盖。要改因子值，请用
+> 新的版本名（如 `v2025-01`）。
 
 ## 实际请求 / 响应示例
 
@@ -216,8 +228,13 @@ curl -s http://localhost:8000/api/snapshots/snap_404159d90ed529d8/products/diese
 {
   "snapshot_id": "snap_404159d90ed529d8",
   "factor_version": "v2023-01",
+  "created_at": "2026-10-02T06:36:18+00:00",
   "product": {
     "product_id": "diesel_delivered",
+    "name": "交付柴油",
+    "producing_process": "distribution",
+    "quantity": "500.000000000000",
+    "unit": "kg",
     "total_kg_co2e": "117.657894736842",
     "unit_kg_co2e": "0.235315789474",
     "contributions": [
@@ -227,21 +244,24 @@ curl -s http://localhost:8000/api/snapshots/snap_404159d90ed529d8/products/diese
        "kind": "external_material", "source": "crude",
        "factor_ref": "ef.crude_oil", "factor_version": "v2023-01",
        "factor_unit": "kg", "factor_kg_co2e_per_unit": "0.080000000000"},
-      {"kg_co2e": "37.026315789474",
+      {"kg_co2e": "37.026315789474", "share_of_product": "0.314694699172",
        "chain": ["refining", "direct_emission", "electricity", "distribution",
                  "diesel_delivered"],
        "kind": "direct_emission", "source": "electricity",
-       "factor_ref": "ef.grid_electricity", "factor_version": "v2023-01"},
-      {"kg_co2e": "29.526315789474",
+       "factor_ref": "ef.grid_electricity", "factor_version": "v2023-01",
+       "factor_unit": "kWh", "factor_kg_co2e_per_unit": "0.703500000000"},
+      {"kg_co2e": "29.526315789474", "share_of_product": "0.250950570342",
        "chain": ["refining", "direct_emission", "natural_gas", "distribution",
                  "diesel_delivered"],
        "kind": "direct_emission", "source": "natural_gas",
-       "factor_ref": "ef.natural_gas", "factor_version": "v2023-01"},
-      {"kg_co2e": "9.000000000000",
+       "factor_ref": "ef.natural_gas", "factor_version": "v2023-01",
+       "factor_unit": "MJ", "factor_kg_co2e_per_unit": "0.056100000000"},
+      {"kg_co2e": "9.000000000000", "share_of_product": "0.076492954596",
        "chain": ["distribution", "direct_emission", "freight",
                  "diesel_delivered"],
        "kind": "direct_emission", "source": "freight",
-       "factor_ref": "ef.truck_freight", "factor_version": "v2023-01"}
+       "factor_ref": "ef.truck_freight", "factor_version": "v2023-01",
+       "factor_unit": "tkm", "factor_kg_co2e_per_unit": "0.090000000000"}
     ]
   }
 }
@@ -270,9 +290,20 @@ curl -s -X POST \
   },
   "factor_changes": [
     {"factor_ref": "ef.crude_oil", "status": "changed",
+     "old_unit": "kg", "new_unit": "kg",
      "old_kg_co2e_per_unit": "0.080000000000",
      "new_kg_co2e_per_unit": "0.075000000000",
-     "delta_kg_co2e_per_unit": "-0.005000000000"}
+     "delta_kg_co2e_per_unit": "-0.005000000000"},
+    {"factor_ref": "ef.grid_electricity", "status": "changed",
+     "old_unit": "kWh", "new_unit": "kWh",
+     "old_kg_co2e_per_unit": "0.703500000000",
+     "new_kg_co2e_per_unit": "0.570300000000",
+     "delta_kg_co2e_per_unit": "-0.133200000000"},
+    {"factor_ref": "ef.truck_freight", "status": "changed",
+     "old_unit": "tkm", "new_unit": "tkm",
+     "old_kg_co2e_per_unit": "0.090000000000",
+     "new_kg_co2e_per_unit": "0.082000000000",
+     "delta_kg_co2e_per_unit": "-0.008000000000"}
   ],
   "product_diffs": [
     {"product_id": "diesel_delivered", "status": "changed",
@@ -285,11 +316,104 @@ curl -s -X POST \
 }
 ```
 
+> **证据口径**：`factor_changes` 的新旧因子值都来自两个快照**封存的
+> `result.factors_used`**，而不是当前 factors 表。因此即使旧因子版本在过去
+> 被错误覆盖（升级前的历史数据），旧侧依旧是封存时的 `0.0800`，与
+> `product_diffs` 所依据的旧快照结果（`0.235315789474`）严格一致；
+> `natural_gas` 两侧数值相同，故不出现在清单中。
+
 再查旧快照 `GET /api/snapshots/snap_404159d90ed529d8`，单位足迹仍是
 `0.235315789474`，因子副本仍是 `v2023-01` 的数值——历史不会被因子更新改写。
-重算接口本身也是幂等的：第二次调用返回 `200` 与同一个新快照 ID。
+重算接口本身也是幂等的：第二次调用返回 `200` 与同一个新快照 ID，差异清单
+同样基于封存证据，重复结果完全一致。
 
-### 5) 错误响应示例（环 + 负量 + 零分母一次性返回）
+### 5) 登记因子版本（不可变，拒绝覆盖）
+
+登记一个新版本返回 `201`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/factor-versions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "v2025-demo",
+    "factors": [
+      {"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+       "kg_co2e_per_unit": "1.200"}
+    ]
+  }'
+```
+
+```json
+{"version": "v2025-demo", "created": true,
+ "idempotent_replay": false, "factor_count": 1}
+```
+
+用**完全相同**的内容（ref 集合、名称、单位、数值按 Decimal 数值比较，
+所以 `1.2` 与 `1.200` 等价）再提交一次，幂等返回 `200`，不写任何数据：
+
+```bash
+curl -s -X POST http://localhost:8000/api/factor-versions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "v2025-demo",
+    "factors": [
+      {"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+       "kg_co2e_per_unit": "1.2"}
+    ]
+  }'
+```
+
+```json
+{"version": "v2025-demo", "created": false,
+ "idempotent_replay": true, "factor_count": 1}
+```
+
+若同名版本中**任一**因子的值 / 单位 / 名称变化，或因子 ref 集合增删，
+返回 `409 Conflict`，差异逐项列出，封存内容原样保留。例如把数值改成 `1.3`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/factor-versions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "v2025-demo",
+    "factors": [
+      {"ref": "ef.hydrogen", "name": "绿氢", "unit": "kg",
+       "kg_co2e_per_unit": "1.3"}
+    ]
+  }'
+```
+
+```json
+{
+  "error": {
+    "code": "FACTOR_VERSION_CONFLICT",
+    "message": "因子版本 v2025-demo 已封存且内容不一致；版本不可覆盖，请改用新的版本名提交",
+    "details": {
+      "version": "v2025-demo",
+      "issues": [
+        {"path": "factors[ref=ef.hydrogen].kg_co2e_per_unit",
+         "code": "FACTOR_VALUE_CONFLICT",
+         "message": "因子 ef.hydrogen 的数值与已封存版本不一致: 1.200 != 1.3"}
+      ]
+    }
+  }
+}
+```
+
+向已存在的 `v2023-01` 提交缺失多个因子、又多出一个新因子的请求体，
+会一次性得到全部差异（节选；`issues` 按 path 稳定排序）：
+
+```json
+{"code": "FACTOR_ADDED",
+ "path": "factors[ref=ef.new_one]", "message": "版本已封存，不能新增因子: ef.new_one"}
+{"code": "FACTOR_REMOVED",
+ "path": "factors[ref=ef.diesel]", "message": "版本已封存，不能删除因子: ef.diesel"}
+```
+
+同一请求体内出现重复因子 ref 返回 `422`（`DUPLICATE_FACTOR`），且不写入任何行。
+**要使用新数值，请登记新版本名**（如 `v2026-01`），随后在核算或重算中引用它。
+
+### 6) 错误响应示例（环 + 负量 + 零分母一次性返回）
 
 `POST /api/assessments`，过程 A 投入 B 的产品、B 投入 A 的产品，且 B 有负投入量、
 质量权重全为 0 → `422 Unprocessable Entity`：
@@ -322,8 +446,15 @@ curl -s -X POST \
 - **分摊与传递**：过程足迹 = 直接排放（数量×因子）+ 外部物料足迹 + Σ上游产品足迹×
   （消耗量/上游批量）；再按所选权重分摊到本过程的全部联产品。贡献链携带每一段的
   缩放与分摊因子，可逐条审计。
+- **因子版本不可变**：`factor_versions` 与 `factors` 仅以普通 `INSERT`
+  在**单个事务**中写入（无 `UPDATE`/`REPLACE`），主键 `(version, ref)`
+  唯一约束兜底。服务层先比对再写入、并用进程级锁串行化；同名重提仅在
+  ref 集合 + 名称 + 单位 + Decimal 数值全等时幂等，否则 `409` 并回滚，
+  跨连接竞态靠 `IntegrityError` 后复核，保证并发提交不部分写入、不互相覆盖。
 - **证据固化**：快照表保存原始请求 JSON、完整结果 JSON（含 `factors_used` 因子值副本）、
-  输入哈希、因子版本、来源快照与 UTC 时间戳，只增不改。
+  输入哈希、因子版本、来源快照与 UTC 时间戳，只增不改。重算的 `product_diffs`
+  与 `factor_changes` **只读取两个快照封存的 `factors_used`**，因此旧因子版本
+  即便在历史上被覆盖，重算结果仍与旧快照自身的足迹一致、且重放幂等。
 - **数值口径**：全链路 `Decimal`（进入时从字符串构造，拒绝 NaN/Infinity），
   50 位上下文运算，输出量化到 12 位小数，差异百分比量化到 6 位。
 
@@ -333,12 +464,13 @@ curl -s -X POST \
 app/
   main.py         FastAPI 路由、异常信封、应用工厂
   models.py       Pydantic 请求模型（Decimal 字符串类型）
+  service.py      因子版本不可变登记、幂等快照、封存证据差异
   accounting.py   校验聚合 + 拓扑计算 + 分摊 + 贡献链
   graph.py        Kahn 拓扑排序 / Tarjan 环检测
   idempotency.py  规范化输入摘要与 SHA-256
   decimals.py     Decimal 精度、量化、JSON 化
-  db.py           SQLite schema 与快照/因子仓储
+  db.py           SQLite schema 与快照/因子仓储（因子只 INSERT）
   seed.py         内置 v2023-01 / v2024-01 因子
-tests/            17 个端到端测试（pytest + TestClient）
+tests/            25 个端到端测试（pytest + TestClient，含并发同名提交）
 docker-compose.yml / Dockerfile
 ```

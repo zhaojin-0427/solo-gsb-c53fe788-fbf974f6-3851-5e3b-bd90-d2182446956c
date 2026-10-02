@@ -105,17 +105,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.post("/api/factor-versions", status_code=201, tags=["factors"])
     def create_factor_version(body: FactorVersionRequest,
                               c: db.sqlite3.Connection = Depends(get_db)):
-        existing = set(db.list_factor_versions(c))
-        created = body.version not in existing
-        # Idempotent upsert: re-POST identical data is 200, new version 201.
-        db.upsert_factor_version(c, body.version, [
-            {"ref": f.ref, "name": f.name, "unit": f.unit,
-             "kg_co2e_per_unit": f.kg_co2e_per_unit}
-            for f in body.factors])
+        result = service.register_factor_version(c, body)
         return JSONResponse(
-            status_code=201 if created else 200,
-            content={"version": body.version, "created": created,
-                     "factor_count": len(body.factors)})
+            status_code=200 if result["idempotent_replay"] else 201,
+            content=result)
 
     # ---------------- assessment / snapshots ----------------------------
 

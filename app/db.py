@@ -70,19 +70,24 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 # -------- factor versions --------------------------------------------------
 
-def upsert_factor_version(conn: sqlite3.Connection, version: str,
+def insert_factor_version(conn: sqlite3.Connection, version: str,
                           factors: List[Dict[str, Any]]) -> None:
+    """Insert a *new* factor version and all its factors atomically.
+
+    Factor versions are immutable: this never UPDATEs or replaces an existing
+    row.  A duplicate version name (or duplicate factor ref inside it) raises
+    ``sqlite3.IntegrityError`` and the whole transaction is rolled back, so a
+    losing concurrent writer can never leave a partially written version.
+    """
     with conn:
         conn.execute(
-            "INSERT OR IGNORE INTO factor_versions(version, created_at) "
-            "VALUES (?, ?)", (version, utcnow()))
-        for f in factors:
-            conn.execute(
-                "INSERT OR REPLACE INTO factors"
-                "(version, ref, name, unit, kg_co2e_per_unit) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (version, f["ref"], f.get("name"), f["unit"],
-                 str(f["kg_co2e_per_unit"])))
+            "INSERT INTO factor_versions(version, created_at) VALUES (?, ?)",
+            (version, utcnow()))
+        conn.executemany(
+            "INSERT INTO factors(version, ref, name, unit, kg_co2e_per_unit) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(version, f["ref"], f.get("name"), f["unit"],
+              str(f["kg_co2e_per_unit"])) for f in factors])
 
 
 def list_factor_versions(conn: sqlite3.Connection) -> List[str]:
